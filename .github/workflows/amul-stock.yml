@@ -1,0 +1,52 @@
+name: Amul stock watcher
+
+# Runs automatically every 5 minutes, and you can also start it by hand
+# from the Actions tab ("Run workflow").
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# Lets the job save the "what did I see last time" file back to the repo.
+permissions:
+  contents: write
+
+# If a run is still going when the next one starts, skip rather than pile up.
+concurrency:
+  group: amul-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependency
+        run: pip install requests
+
+      - name: Check stock
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PINCODE: ${{ secrets.PINCODE }}
+          PRODUCT_ALIASES: ${{ secrets.PRODUCT_ALIASES }}
+        run: python check_amul.py
+
+      - name: Remember what we saw
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add state.json
+            git commit -m "update stock state [skip ci]"
+            git push
+          else
+            echo "No change to save."
+          fi
