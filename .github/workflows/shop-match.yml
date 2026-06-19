@@ -1,0 +1,28 @@
+name: Shopping match
+
+# Run on demand from the Actions tab. Type what you want, and the best
+# Autumn-palette matches come back to your Telegram as photos.
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "What to search for (e.g. men's casual shirt size M)"
+        required: true
+        default: "men's casual shirt"
+
+jobs:
+  match:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests numpy pillow
+      - name: Run search + colour match
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          QUERY: ${{ inputs.query }}
+        run: python shop_match.py
