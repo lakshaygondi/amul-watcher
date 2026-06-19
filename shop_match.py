@@ -1,10 +1,11 @@
 """
-Slice 2 of the shopping tool.
+Slice 2 of the shopping tool (tiered palette).
 
-Searches Google Shopping (India), then for each product detects the dominant
-colour of its image and scores how close it sits to Lorik's Autumn palette
-(his flattering warm/earthy colours plus the neutrals he actually wears).
-Ranks by best colour match and sends the top picks to Telegram as photos.
+Searches Google Shopping (India), detects each product's dominant colour,
+and scores it against Lorik's Autumn palette. Warm signature colours can hit
+100%; cool-dark neutrals (black/navy/charcoal/grey) are wearable but capped
+so they don't crowd out the statement colours. Ranks by match, sends the top
+picks to Telegram as photos.
 
 Size is still just a search hint (typed into the query) — confirm on-site.
 """
@@ -15,10 +16,8 @@ import requests
 import numpy as np
 from PIL import Image
 
-# --- The target palette: Autumn signature colours + wearable neutrals --------
-# Items whose dominant colour lands near any of these score high. Cool pastels,
-# neons and icy tones aren't listed, so they naturally fall to the bottom.
-PALETTE = {
+# Warm Autumn signature colours — full weight, can reach 100%.
+WARM = {
     "rust":          "#B7410E",
     "terracotta":    "#C66B3D",
     "burnt orange":  "#CC5500",
@@ -28,33 +27,32 @@ PALETTE = {
     "forest green":  "#2E5E3A",
     "burgundy":      "#6E2233",
     "warm brown":    "#6F4E37",
-    "cream":         "#EADDBF",
-    "charcoal":      "#36393B",
-    "navy":          "#262B38",
-    "black":         "#1C1C1C",
     "tan":           "#C8A876",
+    "cream":         "#EADDBF",
 }
 
-MAX_PHOTOS = 6          # how many top matches to send as photos
-DIST_ZERO = 60.0        # LAB distance treated as "0% match"
+# Cool / dark neutrals — wearable basics, but capped so they rank below warms.
+NEUTRAL = {
+    "charcoal": "#36393B",
+    "navy":     "#262B38",
+    "black":    "#1C1C1C",
+    "grey":     "#8A8D8F",
+}
+
+MAX_PHOTOS = 6
+DIST_ZERO = 60.0       # LAB distance treated as "0% match"
+NEUTRAL_CAP = 75       # neutrals can't score above this
 
 
-# --- colour maths -------------------------------------------------------------
 def _srgb_to_lab(rgb):
-    """Convert an (r,g,b) 0-255 colour to CIE-Lab (D65)."""
     rgb = np.asarray(rgb, dtype=float) / 255.0
-    # inverse gamma
     rgb = np.where(rgb > 0.04045, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
     m = np.array([[0.4124, 0.3576, 0.1805],
                   [0.2126, 0.7152, 0.0722],
                   [0.0193, 0.1192, 0.9505]])
-    xyz = m @ rgb
-    xyz = xyz / np.array([0.95047, 1.0, 1.08883])   # D65 white
+    xyz = (m @ rgb) / np.array([0.95047, 1.0, 1.08883])
     f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
-    L = 116 * f[1] - 16
-    a = 500 * (f[0] - f[1])
-    b = 200 * (f[1] - f[2])
-    return np.array([L, a, b])
+    return np.array([116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])])
 
 
 def _hex_to_rgb(h):
@@ -62,35 +60,36 @@ def _hex_to_rgb(h):
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
-# Pre-compute LAB for every palette colour once.
-_PALETTE_LAB = {name: _srgb_to_lab(_hex_to_rgb(hx)) for name, hx in PALETTE.items()}
+_WARM_LAB = {n: _srgb_to_lab(_hex_to_rgb(h)) for n, h in WARM.items()}
+_NEUT_LAB = {n: _srgb_to_lab(_hex_to_rgb(h)) for n, h in NEUTRAL.items()}
 
 
 def dominant_color(img):
-    """Find the main product colour, ignoring white/black background & shadow."""
     arr = np.asarray(img.convert("RGB").resize((64, 64))).reshape(-1, 3).astype(float)
-    mask = ~(((arr > 235).all(axis=1)) | ((arr < 25).all(axis=1)))  # drop bg/shadow
+    mask = ~(((arr > 235).all(axis=1)) | ((arr < 25).all(axis=1)))
     pix = arr[mask] if mask.sum() > 30 else arr
-    buckets = (pix // 24 * 24).astype(int)                          # quantise
+    buckets = (pix // 24 * 24).astype(int)
     vals, counts = np.unique(buckets, axis=0, return_counts=True)
     modal = vals[counts.argmax()]
-    in_bucket = pix[(buckets == modal).all(axis=1)]                 # true centroid
-    return in_bucket.mean(axis=0)
+    return pix[(buckets == modal).all(axis=1)].mean(axis=0)
+
+
+def _nearest(lab, table):
+    name, dist = min(((n, float(np.linalg.norm(lab - l))) for n, l in table.items()),
+                     key=lambda x: x[1])
+    pct = max(0, round(100 * (1 - min(dist, DIST_ZERO) / DIST_ZERO)))
+    return pct, name
 
 
 def match_score(rgb):
-    """Return (match_percent, nearest_palette_name) for a colour."""
+    """Best warm match (full) vs best neutral match (capped); higher wins."""
     lab = _srgb_to_lab(rgb)
-    best_name, best_dist = None, 1e9
-    for name, plab in _PALETTE_LAB.items():
-        d = float(np.linalg.norm(lab - plab))
-        if d < best_dist:
-            best_dist, best_name = d, name
-    pct = max(0, round(100 * (1 - min(best_dist, DIST_ZERO) / DIST_ZERO)))
-    return pct, best_name
+    wpct, wname = _nearest(lab, _WARM_LAB)
+    npct, nname = _nearest(lab, _NEUT_LAB)
+    npct = min(npct, NEUTRAL_CAP)
+    return (wpct, wname) if wpct >= npct else (npct, nname)
 
 
-# --- data + delivery ----------------------------------------------------------
 def search_shopping(query, key):
     params = {"engine": "google_shopping", "q": query, "gl": "in",
               "hl": "en", "google_domain": "google.co.in", "api_key": key}
